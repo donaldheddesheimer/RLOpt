@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn
 import torch.optim
+from torch.nn.parameter import UninitializedParameter
 from tensordict import TensorDict
 from tensordict.base import TensorDictBase
 from tensordict.nn import CudaGraphModule, TensorDictModule
@@ -832,7 +833,11 @@ class BaseAlgorithm(ABC):
             if module is None:
                 continue
             for name, param in module.named_parameters(recurse=True):
-                if param is None or not torch.is_floating_point(param):
+                if param is None:
+                    continue
+                if isinstance(param, UninitializedParameter):
+                    continue
+                if not torch.is_floating_point(param):
                     continue
                 param_id = id(param)
                 if param_id in seen:

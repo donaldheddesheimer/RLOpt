@@ -127,11 +127,9 @@ class SACRLOptConfig(RLOptConfig):
             output_dim=1,
         )
 
-        self.value_function = NetworkConfig(
-            num_cells=[256, 128, 128],
-            activation_fn="elu",
-            output_dim=1,
-        )
+        # SAC doesn't require a separate value function when using Q-functions
+        # Set to None to avoid unnecessary computation
+        self.value_function = None
 
 
 class SAC(BaseAlgorithm):
@@ -214,10 +212,16 @@ class SAC(BaseAlgorithm):
             device=self.device,
         )
 
+        # Use "observation" as input key to match environment observations
+        policy_in_keys = self.config.policy.get_input_keys()
+        if policy_in_keys == ["policy"]:
+            # Replace default "policy" key with actual observation key
+            policy_in_keys = ["observation"]
+
         # Wrap in TensorDictModule
         policy_td = TensorDictModule(
             module=net,
-            in_keys=self.config.policy.get_input_keys(),
+            in_keys=policy_in_keys,
             out_keys=["loc", "scale"],
         )
 
@@ -268,6 +272,12 @@ class SAC(BaseAlgorithm):
 
         # SAC Q-function takes both observation and action as inputs
         in_keys = self.config.q_function.get_input_keys()
+        # Replace default "policy" key with actual observation key if needed
+        if in_keys == ["policy"]:
+            in_keys = ["observation"]
+        elif in_keys[0] == "policy":
+            in_keys[0] = "observation"
+        
         if "action" not in in_keys:
             in_keys.append("action")
 
@@ -281,7 +291,7 @@ class SAC(BaseAlgorithm):
         assert self.config.value_function is not None
         num_cells = list(self.config.value_function.num_cells)
         value_function = MLP(
-            in_features=123,
+            in_features=self.config.value_function.input_dim,
             activation_class=get_activation_class(
                 self.config.value_function.activation_fn
             ),
@@ -289,9 +299,16 @@ class SAC(BaseAlgorithm):
             out_features=1,
             device=self.device,
         )
+        # Use observation as input key instead of default "policy"
+        in_keys = self.config.value_function.get_input_keys()
+        if in_keys == ["policy"]:
+            in_keys = ["observation"]
+        elif in_keys[0] == "policy":
+            in_keys[0] = "observation"
+        
         return ValueOperator(
             module=value_function,
-            in_keys=self.config.value_function.get_input_keys(),
+            in_keys=in_keys,
             out_keys=["state_value"],
         )
 
@@ -311,13 +328,16 @@ class SAC(BaseAlgorithm):
             )
 
         class IdentityModule(torch.nn.Module):
-            def forward(self, *x):
-                return x[0] if len(x) == 1 else x
+            def forward(self, x):
+                return x
 
+        # Use observation key instead of "policy" for the dummy module
+        # to match the actual environment observation structure
+        obs_keys = ["observation"]
         dummy = TensorDictModule(
             module=IdentityModule(),
-            in_keys=self.config.policy.get_input_keys(),
-            out_keys=self.config.policy.get_input_keys(),
+            in_keys=obs_keys,
+            out_keys=obs_keys,
         )
         return ActorCriticOperator(
             common_operator=dummy,
@@ -421,6 +441,13 @@ class SAC(BaseAlgorithm):
         batch_size = cfg.loss.mini_batch_size
         shared = cfg.collector.shared
         prefetch = cfg.replay_buffer.prefetch
+        
+        # Disable pin_memory and prefetch on CPU devices to avoid device mismatch errors
+        # (especially on macOS with MPS fallback)
+        pin_memory = device != "cpu"
+        if device == "cpu":
+            prefetch = None
+        
         storage_cls = (
             functools.partial(LazyTensorStorage, device=device)
             if not scratch_dir
@@ -432,7 +459,7 @@ class SAC(BaseAlgorithm):
             replay_buffer = TensorDictPrioritizedReplayBuffer(
                 alpha=0.7,
                 beta=0.5,
-                pin_memory=True,
+                pin_memory=pin_memory,
                 prefetch=prefetch,
                 storage=storage_cls(
                     max_size=buffer_size, compilable=cfg.compile.compile
@@ -444,7 +471,7 @@ class SAC(BaseAlgorithm):
             )
         else:
             replay_buffer = TensorDictReplayBuffer(
-                pin_memory=True,
+                pin_memory=pin_memory,
                 prefetch=prefetch,
                 sampler=sampler,
                 storage=storage_cls(
@@ -515,6 +542,8 @@ class SAC(BaseAlgorithm):
 
         # Update qnet_target params
         self.target_net_updater.step()
+
+        self.total_network_updates += 1
 
         return loss_td.detach_()
 

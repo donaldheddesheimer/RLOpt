@@ -119,6 +119,12 @@ def apply_env_config(rlopt_config, env_config: dict[str, Any]) -> None:
         sac = env_config["sac"]
         if "utd_ratio" in sac:
             rlopt_config.sac.utd_ratio = sac["utd_ratio"]
+        if "feature_update_ratio" in sac:
+            rlopt_config.sac.feature_update_ratio = sac["feature_update_ratio"]
+        if "actor_update_freq" in sac:
+            rlopt_config.sac.actor_update_freq = sac["actor_update_freq"]
+        if "target_update_freq" in sac:
+            rlopt_config.sac.target_update_freq = sac["target_update_freq"]
     
     # Apply parallel env settings
     if "parallel" in env_config:
