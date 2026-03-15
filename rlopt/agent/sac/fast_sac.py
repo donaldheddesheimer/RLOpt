@@ -21,6 +21,8 @@ from typing import Any, cast
 
 import torch
 from tensordict import TensorDict
+from tensordict.nn import TensorDictModule
+from torchrl.modules import ActorCriticOperator
 from torchrl.record.loggers import Logger
 
 from rlopt.agent.sac.sac import SAC, SACConfig, SACRLOptConfig
@@ -93,6 +95,7 @@ class FastSAC(SAC):
         logger: Logger | None = None,
         **kwargs,
     ):
+        self._normalize_network_input_keys(config)
         super().__init__(
             env=env,
             config=config,
@@ -106,6 +109,74 @@ class FastSAC(SAC):
         # Counters for staged scheduling verification
         self.total_actor_updates = 0
         self.total_target_updates = 0
+
+    @staticmethod
+    def _normalize_nested_keys(
+        keys: list[Any] | None,
+    ) -> list[str | tuple[str, ...]] | None:
+        if keys is None:
+            return None
+
+        normalized: list[str | tuple[str, ...]] = []
+        for key in keys:
+            if isinstance(key, str):
+                normalized.append(key)
+                continue
+
+            try:
+                nested_key = tuple(key)
+            except TypeError as exc:
+                raise ValueError(
+                    "FastSAC input_keys entries must be strings or sequences of strings."
+                ) from exc
+
+            if len(nested_key) == 0 or not all(
+                isinstance(part, str) for part in nested_key
+            ):
+                raise ValueError(
+                    "FastSAC input_keys nested entries must be non-empty sequences of strings."
+                )
+
+            normalized.append(nested_key)
+
+        return normalized
+
+    @classmethod
+    def _normalize_network_input_keys(cls, config: FastSACRLOptConfig) -> None:
+        for network_name in ("policy", "q_function", "value_function"):
+            network_cfg = getattr(config, network_name, None)
+            if not isinstance(network_cfg, NetworkConfig):
+                continue
+            normalized = cls._normalize_nested_keys(network_cfg.input_keys)
+            if normalized is not None:
+                network_cfg.input_keys = cast(list[str], normalized)
+
+    def _construct_actor_critic(self) -> TensorDictModule:
+        if self.q_function is None or self.policy is None:
+            msg = "SAC requires a Q-function and policy configuration."
+            raise ValueError(msg)
+
+        if self.feature_extractor:
+            return ActorCriticOperator(
+                common_operator=self.feature_extractor,
+                policy_operator=self.policy,
+                value_operator=self.q_function,
+            )
+
+        class NoOpModule(torch.nn.Module):
+            def forward(self):
+                return ()
+
+        dummy = TensorDictModule(
+            module=NoOpModule(),
+            in_keys=[],
+            out_keys=[],
+        )
+        return ActorCriticOperator(
+            common_operator=dummy,
+            policy_operator=self.policy,
+            value_operator=self.q_function,
+        )
 
     # ------------------------------------------------------------------
     # Optimizers — store individual references for staged stepping
@@ -141,9 +212,10 @@ class FastSAC(SAC):
         do_actor = (self.total_network_updates % sac_cfg.actor_update_freq == 0)
         do_target = (self.total_network_updates % sac_cfg.target_update_freq == 0)
 
-        policy_op = self.actor_critic.get_policy_operator()
         kl_context = None
+        policy_op = None
         if (self.config.optim.scheduler or "").lower() == "adaptive":
+            policy_op = self.actor_critic.get_policy_operator()
             kl_context = self._prepare_kl_context(sampled_tensordict, policy_op)
 
         sampled_tensordict = self._ensure_old_policy_info(sampled_tensordict)
@@ -176,7 +248,7 @@ class FastSAC(SAC):
                 self._alpha_optim.zero_grad(set_to_none=True)
             self.total_actor_updates += 1
 
-            if kl_context is not None:
+            if kl_context is not None and policy_op is not None:
                 kl_approx = self._compute_kl_after_update(kl_context, policy_op)
                 if kl_approx is not None:
                     loss_td.set("kl_approx", kl_approx.detach())
