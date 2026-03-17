@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
@@ -187,7 +187,29 @@ def list_available_configs(config_dir: str | Path = "configs/env") -> list[str]:
 
 def dedupe_keys(keys: list[BatchKey]) -> list[BatchKey]:
     """Return keys in insertion order, removing duplicates."""
-    return list(dict.fromkeys(keys))
+    normalized = [normalize_batch_key(key) for key in keys]
+    return list(dict.fromkeys(normalized))
+
+
+def normalize_batch_key(key: Any) -> BatchKey:
+    """Normalize key-like values to ``str`` or ``tuple[str, ...]``."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, tuple):
+        normalized_tuple = tuple(str(part) for part in key)
+        if len(normalized_tuple) == 0:
+            raise ValueError("Batch key sequence must not be empty.")
+        if len(normalized_tuple) == 1:
+            return normalized_tuple[0]
+        return normalized_tuple
+    if isinstance(key, Sequence):
+        normalized_tuple = tuple(str(part) for part in key)
+        if len(normalized_tuple) == 0:
+            raise ValueError("Batch key sequence must not be empty.")
+        if len(normalized_tuple) == 1:
+            return normalized_tuple[0]
+        return normalized_tuple
+    raise TypeError(f"Unsupported key type: {type(key)!r}")
 
 
 def next_obs_key(key: ObsKey) -> tuple[str, ...]:

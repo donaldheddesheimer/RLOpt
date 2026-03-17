@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import functools
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -431,11 +434,23 @@ class SAC(BaseAlgorithm):
         eps = self.config.optim.target_update_polyak
         return SoftUpdate(self.loss_module, eps=eps)
 
+    def _resolve_replay_scratch_dir(self, scratch_dir: str) -> str:
+        base_dir = Path(scratch_dir).expanduser()
+        run_id = os.environ.get("RLOPT_FASTSAC_RUN_ID")
+        if run_id is None or len(run_id) == 0:
+            run_id = f"{os.getpid()}_{uuid4().hex[:8]}"
+
+        run_dir = base_dir / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return str(run_dir)
+
     def _construct_data_buffer(self) -> ReplayBuffer:
         cfg = self.config
         assert isinstance(cfg, SACRLOptConfig)
         sampler = RandomSampler()
         scratch_dir = cfg.replay_buffer.scratch_dir or cfg.collector.scratch_dir
+        if scratch_dir:
+            scratch_dir = self._resolve_replay_scratch_dir(scratch_dir)
         device = cfg.device
         buffer_size = cfg.replay_buffer.size
         batch_size = cfg.loss.mini_batch_size
