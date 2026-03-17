@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import functools
 import logging
 import math
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -17,12 +17,9 @@ from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
 from torchrl.collectors import SyncDataCollector
 from torchrl.data import (
-    LazyMemmapStorage,
-    LazyTensorStorage,
     ReplayBuffer,
     TensorDictReplayBuffer,
 )
-from torchrl.data.replay_buffers.samplers import RandomSampler
 from torchrl.envs.utils import set_exploration_type
 from torchrl.modules import MLP
 from torchrl.record.loggers import Logger
@@ -41,10 +38,6 @@ from rlopt.config_utils import (
 )
 from rlopt.type_aliases import OptimizerClass
 from rlopt.utils import get_activation_class, log_info
-
-# Suppress torch.compile CUDA graph diagnostic messages
-logging.getLogger("torch._dynamo").setLevel(logging.ERROR)
-logging.getLogger("torch._inductor").setLevel(logging.ERROR)
 
 
 @dataclass
@@ -106,20 +99,32 @@ class IPMDConfig(PPOConfig):
     Default is False. Set to True to train PPO on estimated rewards.
     """
 
+    estimated_reward_clamp_min: float | None = 0.0
+    """Optional lower bound applied to estimated rewards before PPO reward mixing.
+
+    Set to ``None`` to disable lower clipping.
+    """
+
+    estimated_reward_clamp_max: float | None = 0.25
+    """Optional upper bound applied to estimated rewards before PPO reward mixing.
+
+    Set to ``None`` to disable upper clipping.
+    """
+
+    estimated_reward_mix_coeff: float = 0.3
+    """Linear mixing coefficient for estimated rewards in PPO.
+
+    Mixed reward is computed as:
+    ``reward = estimated_reward_mix_coeff * est_rew + (1 - estimated_reward_mix_coeff) * env_reward``.
+    """
+
     expert_batch_size: int | None = None
     """Batch size for expert data sampling. If None, uses the same as mini_batch_size."""
 
-    detach_reward_when_used_for_ppo: bool = True
-    """Detach the estimated reward when injecting into PPO (GAE/reward).
-
-    Prevents PPO updates from backpropagating into the reward estimator.
-    The reward network is then trained solely via the IPMD objective.
-    """
-
-    bc_loss_coeff: float = 0.0
+    bc_coef: float = 1.0
     """Behavior cloning (MLE) loss coefficient on expert actions.
 
-    When > 0, adds ``-bc_loss_coeff * mean(log_prob(expert_action | policy))``
+    When > 0, adds ``-bc_coef * mean(log_prob(expert_action | policy))``
     to each update step.  This regularises the policy toward expert actions
     during early training.  Set to 0 to disable (default).
     """
@@ -158,18 +163,6 @@ class IPMD(PPO):
         self.config: IPMDRLOptConfig
         self.env = env
 
-        super().__init__(
-            env=env,
-            config=config,
-            policy_net=policy_net,
-            value_net=value_net,
-            q_net=q_net,
-            replay_buffer=replay_buffer,
-            logger=logger,
-            feature_extractor_net=feature_extractor_net,
-            **kwargs,
-        )
-
         self.config = cast(IPMDRLOptConfig, self.config)
 
         # Observation key groups can differ across policy, value, and reward model.
@@ -202,22 +195,57 @@ class IPMD(PPO):
 
         # Expert data source
         self._expert_buffer: TensorDictReplayBuffer | None = None
+        self._expert_batch_sampler: (
+            Callable[[int, list[BatchKey]], TensorDict | None] | None
+        ) = None
         self._warned_no_expert = False
+        self._auto_attach_env_expert_sampler()
 
-        # Re-create optimizer to include reward_estimator parameters
-        self.optim = self._configure_optimizers()
+        # Pre-cache compile-friendly scalars from config
+        self._cache_ipmd_scalars()
 
-    def _compile_components(self) -> None:
-        """Compile update (fixed signature for torch.compile and CUDA graphs)."""
-        cfg = self.config
-        assert isinstance(cfg, IPMDRLOptConfig)
-        if not cfg.compile.compile:
-            return
-        compile_mode = cfg.compile.compile_mode or (
-            "default" if cfg.compile.cudagraphs else "reduce-overhead"
+        super().__init__(
+            env=env,
+            config=config,
+            policy_net=policy_net,
+            value_net=value_net,
+            q_net=q_net,
+            replay_buffer=replay_buffer,
+            logger=logger,
+            feature_extractor_net=feature_extractor_net,
+            **kwargs,
         )
-        self.update = torch.compile(self.update, mode=compile_mode)  # type: ignore[method-assign]
-        self.adv_module = torch.compile(self.adv_module, mode=compile_mode)  # type: ignore[method-assign]
+
+        self._refresh_grad_clip_params()
+        self._policy_operator = self.actor_critic.get_policy_operator()
+        self._bc_debug_anomaly_prints = 0
+
+    def _cache_ipmd_scalars(self) -> None:
+        """Pre-cache config scalars and reward-input flags for compile-friendly hot paths."""
+        cfg = self.config.ipmd
+        rit = cfg.reward_input_type
+        # Boolean flags for reward input assembly (avoids Python branching in update)
+        self._rit_use_s: bool = rit in ("s", "sa", "sas")
+        self._rit_use_a: bool = rit in ("sa", "sas")
+        self._rit_use_sn: bool = rit in ("s'", "sas")
+        # Scalar caches
+        self._reward_loss_coeff: float = float(cfg.reward_loss_coeff)
+        self._reward_l2_coeff: float = float(cfg.reward_l2_coeff)
+        self._bc_coeff: float = float(cfg.bc_coef)
+        self._reward_detach_features: bool = bool(cfg.reward_detach_features)
+        max_grad = getattr(self.config.optim, "max_grad_norm", None)
+        self._max_grad_norm: float = float(max_grad) if max_grad else 1e10
+        # Output activation as a callable (eliminates string dispatch at call time)
+        out_act = cfg.reward_output_activation
+        scale = float(cfg.reward_output_scale)
+        if out_act == "tanh":
+            self._reward_out_fn: Callable[[Tensor], Tensor] = lambda r: (
+                torch.tanh(r) * scale
+            )
+        elif out_act == "sigmoid":
+            self._reward_out_fn = lambda r: torch.sigmoid(r) * scale
+        else:
+            self._reward_out_fn = lambda r: r
 
     _REWARD_INPUT_TYPES = frozenset({"s", "s'", "sa", "sas"})
 
@@ -263,24 +291,22 @@ class IPMD(PPO):
     ) -> Tensor:
         parts: list[Tensor] = []
         for key in keys:
-            td_key: BatchKey = next_obs_key(key) if next_obs else key
-            obs = cast(Tensor, td.get(td_key))
-            obs = flatten_feature_tensor(obs, self._obs_feature_ndims[key])
+            obs = flatten_feature_tensor(
+                td.get(next_obs_key(key) if next_obs else key),
+                self._obs_feature_ndims[key],
+            )
             parts.append(obs.detach() if detach else obs)
-        if len(parts) == 1:
-            return parts[0]
-        return torch.cat(parts, dim=-1)
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
 
     def _action_features_from_td(self, td: TensorDict | Any, *, detach: bool) -> Tensor:
-        action = cast(Tensor, td.get("action"))
-        action = flatten_feature_tensor(action, self._action_feature_ndim)
+        action = flatten_feature_tensor(td.get("action"), self._action_feature_ndim)
         return action.detach() if detach else action
 
     def _expert_required_keys(self) -> list[BatchKey]:
         """Return expert-batch keys required by current IPMD settings."""
         assert isinstance(self.config, IPMDRLOptConfig)
         rit = self.config.ipmd.reward_input_type
-        bc_enabled = float(self.config.ipmd.bc_loss_coeff) > 0.0
+        bc_enabled = float(self.config.ipmd.bc_coef) > 0.0
 
         required: list[BatchKey] = []
         if rit in ("s", "sa", "sas"):
@@ -326,6 +352,13 @@ class IPMD(PPO):
         self._initialize_weights(net, cfg.ipmd.reward_init)
         return net
 
+    def _compile_components(self) -> None:
+        """Compile reward estimator and update method with torch.compile (if enabled)."""
+        if not self.config.compile.compile:
+            return
+        super()._compile_components()
+        self.reward_estimator = torch.compile(self.reward_estimator)
+
     def _set_optimizers(
         self, optimizer_cls: OptimizerClass, optimizer_kwargs: dict[str, Any]
     ) -> list[torch.optim.Optimizer]:
@@ -338,93 +371,121 @@ class IPMD(PPO):
         if not hasattr(self, "reward_estimator"):
             return super()._set_optimizers(optimizer_cls, optimizer_kwargs)
         # PPO uses one optimizer for actor_critic; add reward_estimator to the same group
-        base_optimizers = super()._set_optimizers(optimizer_cls, optimizer_kwargs)
-        assert len(base_optimizers) == 1
         all_params = list(self.actor_critic.parameters()) + list(
             self.reward_estimator.parameters()
         )
         return [optimizer_cls(all_params, **optimizer_kwargs)]
 
-    # -------------------------
-    # Expert data API
-    # -------------------------
-    def set_expert_buffer(self, buffer: TensorDictReplayBuffer) -> None:
-        """Attach an expert replay buffer.
+    @staticmethod
+    def _discover_env_method(env: object, method_name: str) -> Callable | None:
+        """Discover a callable by walking common wrapper attributes."""
+        stack: list[object] = [env]
+        visited: set[int] = set()
 
-        Required keys depend on ``reward_input_type``, ``reward_input_keys``, and
-        whether behavior cloning is enabled.
-        """
-        self._expert_buffer = buffer
+        while len(stack) > 0:
+            current = stack.pop()
+            obj_id = id(current)
+            if obj_id in visited:
+                continue
+            visited.add(obj_id)
 
-    def create_expert_buffer(
-        self, expert_data: TensorDict, buffer_size: int | None = None
-    ) -> TensorDictReplayBuffer:
-        """Create an expert replay buffer from expert demonstration data."""
-        if buffer_size is None:
-            buffer_size = expert_data.numel()
+            method = getattr(current, method_name, None)
+            if callable(method):
+                return method
 
-        cfg = self.config
-        assert isinstance(cfg, IPMDRLOptConfig)
-        sampler = RandomSampler()
-        scratch_dir = cfg.collector.scratch_dir
-        device = cfg.device
-        batch_size = cfg.loss.mini_batch_size
-        shared = cfg.collector.shared
-        prefetch = cfg.collector.prefetch
+            for attr_name in ("base_env", "env", "_env", "unwrapped"):
+                try:
+                    next_obj = getattr(current, attr_name, None)
+                except Exception:
+                    continue
+                if next_obj is None:
+                    continue
+                if isinstance(next_obj, (list, tuple)):
+                    stack.extend(next_obj)
+                else:
+                    stack.append(next_obj)
+        return None
 
-        storage_cls = (
-            functools.partial(LazyTensorStorage, device=device)
-            if not scratch_dir
-            else functools.partial(
-                LazyMemmapStorage, device="cpu", scratch_dir=scratch_dir
+    def _auto_attach_env_expert_sampler(self) -> None:
+        """Auto-attach expert sampler from env if available."""
+        sampler = self._discover_env_method(self.env, "sample_expert_batch")
+        if sampler is None:
+            return
+
+        def _wrapped_sampler(
+            batch_size: int, required_keys: list[BatchKey]
+        ) -> TensorDict | None:
+            return cast(
+                TensorDict | None,
+                sampler(batch_size=batch_size, required_keys=required_keys),
             )
-        )
 
-        expert_buffer = TensorDictReplayBuffer(
-            pin_memory=False,
-            prefetch=prefetch,
-            sampler=sampler,
-            storage=storage_cls(max_size=buffer_size, compilable=cfg.compile.compile),
-            batch_size=batch_size,
-            shared=shared,
-        )
-        expert_buffer.extend(expert_data.reshape(-1))
-        if scratch_dir:
-            expert_buffer.append_transform(lambda td: td.to(device))  # type: ignore[arg-type]
-        return expert_buffer
+        self._expert_batch_sampler = _wrapped_sampler
 
     def _check_expert_batch_keys(self, expert_batch: TensorDict) -> bool:
         required_keys = self._expert_required_keys()
         available_keys = expert_batch.keys(True)
-        missing = [key for key in required_keys if key not in available_keys]
+        missing = [
+            key
+            for key in required_keys
+            if key not in available_keys
+            and not (key == "action" and "expert_action" in available_keys)
+        ]
         if missing:
             self.log.warning("Expert batch missing required keys: %s", missing)
             return False
         return True
 
+    @staticmethod
+    def _expert_action_from_td(td: TensorDict | Any) -> Tensor | None:
+        action = td.get("expert_action")
+        if action is not None:
+            return cast(Tensor, action)
+        action = td.get("action")
+        if action is not None:
+            return cast(Tensor, action)
+        return None
+
     def _next_expert_batch(self) -> TensorDict | None:
-        if self._expert_buffer is None:
-            return None
-        try:
-            expert_batch = cast(
-                TensorDict,
-                self._expert_buffer.sample(
-                    batch_size=self.config.ipmd.expert_batch_size
-                ),
-            )
-            # expert_batch = flatten_obs_group(expert_batch)
-            assert isinstance(self.config, IPMDRLOptConfig)
-            if (
-                self.config.ipmd.expert_batch_size is not None
-                and expert_batch.numel() > self.config.ipmd.expert_batch_size
-            ):
+        assert isinstance(self.config, IPMDRLOptConfig)
+        effective_batch_size = int(
+            self.config.ipmd.expert_batch_size or self.config.loss.mini_batch_size
+        )
+
+        if self._expert_buffer is not None:
+            try:
                 expert_batch = cast(
                     TensorDict,
-                    expert_batch[: self.config.ipmd.expert_batch_size],
+                    self._expert_buffer.sample(
+                        batch_size=self.config.ipmd.expert_batch_size
+                    ),
                 )
-            return expert_batch
-        except Exception:
+                if (
+                    self.config.ipmd.expert_batch_size is not None
+                    and expert_batch.numel() > self.config.ipmd.expert_batch_size
+                ):
+                    expert_batch = cast(
+                        TensorDict,
+                        expert_batch[: self.config.ipmd.expert_batch_size],
+                    )
+                return expert_batch
+            except Exception:
+                return None
+
+        if self._expert_batch_sampler is None:
             return None
+        try:
+            expert_batch = self._expert_batch_sampler(
+                effective_batch_size, self._expert_required_keys()
+            )
+        except Exception as err:
+            self.log.warning("Failed to sample expert batch from sampler: %s", err)
+            return None
+        if expert_batch is None:
+            return None
+        if expert_batch.numel() > effective_batch_size:
+            expert_batch = cast(TensorDict, expert_batch[:effective_batch_size])
+        return expert_batch
 
     def _dummy_expert_batch(self, batch: TensorDict) -> TensorDict:
         """Return a single-transition expert batch with same structure as batch (for compile/CUDA graph)."""
@@ -475,6 +536,19 @@ class IPMD(PPO):
                 "loss_entropy": torch.tensor(0.0, device=self.device),
                 "loss_reward_diff": torch.tensor(0.0, device=self.device),
                 "loss_reward_l2": torch.tensor(0.0, device=self.device),
+                "loss_bc": torch.tensor(0.0, device=self.device),
+                "bc_nll": torch.tensor(0.0, device=self.device),
+                "bc_has_expert": torch.tensor(0.0, device=self.device),
+                "bc_log_prob_mean": torch.tensor(0.0, device=self.device),
+                "bc_log_prob_nan_frac": torch.tensor(0.0, device=self.device),
+                "bc_expert_action_abs_mean": torch.tensor(0.0, device=self.device),
+                "bc_expert_action_zero_frac": torch.tensor(0.0, device=self.device),
+                "bc_expert_action_nan_frac": torch.tensor(0.0, device=self.device),
+                "bc_policy_action_abs_mean": torch.tensor(0.0, device=self.device),
+                "bc_policy_action_mae": torch.tensor(0.0, device=self.device),
+                "bc_policy_action_rmse": torch.tensor(0.0, device=self.device),
+                "bc_actor_grad_norm": torch.tensor(0.0, device=self.device),
+                "bc_policy_scale_mean": torch.tensor(0.0, device=self.device),
                 "estimated_reward_mean": torch.tensor(0.0, device=self.device),
                 "estimated_reward_std": torch.tensor(0.0, device=self.device),
                 "expert_reward_mean": torch.tensor(0.0, device=self.device),
@@ -487,43 +561,116 @@ class IPMD(PPO):
 
     def _reward_from_batch(self, td: TensorDict | Any) -> Tensor:
         """Compute estimated reward for a batch of transitions."""
-        assert isinstance(self.config, IPMDRLOptConfig)
-        rit = self.config.ipmd.reward_input_type
-        detach = self.config.ipmd.reward_detach_features
-
+        # Uses pre-cached flags (_rit_use_s, _rit_use_a, _rit_use_sn) — no Python
+        # branching on config strings at call time, making this compile-friendly.
+        detach = self._reward_detach_features
         parts: list[Tensor] = []
-        if rit in ("s", "sa", "sas"):
+        if self._rit_use_s:
             parts.append(
                 self._obs_features_from_td(
-                    td,
-                    self._reward_obs_keys,
-                    next_obs=False,
-                    detach=detach,
+                    td, self._reward_obs_keys, next_obs=False, detach=detach
                 )
             )
-        if rit in ("sa", "sas"):
+        if self._rit_use_a:
             parts.append(self._action_features_from_td(td, detach=detach))
-        if rit in ("s'", "sas"):
+        if self._rit_use_sn:
             parts.append(
                 self._obs_features_from_td(
-                    td,
-                    self._reward_obs_keys,
-                    next_obs=True,
-                    detach=detach,
+                    td, self._reward_obs_keys, next_obs=True, detach=detach
                 )
             )
-
         x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
-        r = self.reward_estimator(x)
+        return self._reward_out_fn(self.reward_estimator(x))
 
-        # Apply output activation to bound the reward
-        out_act = self.config.ipmd.reward_output_activation
-        if out_act == "tanh":
-            r = torch.tanh(r) * self.config.ipmd.reward_output_scale
-        elif out_act == "sigmoid":
-            r = torch.sigmoid(r) * self.config.ipmd.reward_output_scale
-        # "none" — keep unbounded
-        return r
+    @staticmethod
+    def _reward_tensor_stats(prefix: str, reward: Tensor) -> dict[str, float]:
+        reward_f = reward.detach().float()
+        return {
+            f"{prefix}_mean": reward_f.mean().item(),
+            f"{prefix}_std": reward_f.std().item(),
+            f"{prefix}_min": reward_f.min().item(),
+            f"{prefix}_max": reward_f.max().item(),
+        }
+
+    @staticmethod
+    def _reward_alignment_metrics(
+        prefix: str, reward_pred: Tensor, reward_true: Tensor
+    ) -> dict[str, float]:
+        pred = reward_pred.detach().float().flatten()
+        true = reward_true.detach().float().flatten()
+        diff = pred - true
+
+        pred_mean = pred.mean()
+        true_mean = true.mean()
+        pred_centered = pred - pred_mean
+        true_centered = true - true_mean
+
+        pred_var = pred_centered.pow(2).mean()
+        true_var = true_centered.pow(2).mean()
+        cov = (pred_centered * true_centered).mean()
+
+        pearson_corr, corr_distance = epic_distance(pred, true)
+
+        eps = 1e-8
+        if pred_var <= eps:
+            affine_scale = torch.zeros((), device=pred.device, dtype=pred.dtype)
+            affine_bias = true_mean
+            fitted = torch.full_like(true, true_mean)
+        else:
+            affine_scale = cov / pred_var
+            affine_bias = true_mean - affine_scale * pred_mean
+            fitted = affine_scale * pred + affine_bias
+
+        resid = true - fitted
+        ss_res = resid.pow(2).sum()
+        ss_tot = true_centered.pow(2).sum()
+        if ss_tot <= eps:
+            affine_r2 = torch.ones((), device=pred.device, dtype=pred.dtype)
+        else:
+            affine_r2 = 1.0 - ss_res / ss_tot
+
+        return {
+            f"{prefix}/pearson_corr": pearson_corr.item(),
+            f"{prefix}/corr_distance": corr_distance.item(),
+            f"{prefix}/mae": diff.abs().mean().item(),
+            f"{prefix}/rmse": diff.pow(2).mean().sqrt().item(),
+            f"{prefix}/affine_scale": affine_scale.item(),
+            f"{prefix}/affine_bias": affine_bias.item(),
+            f"{prefix}/affine_r2": affine_r2.item(),
+            f"{prefix}/target_std": true_var.sqrt().item(),
+            f"{prefix}/pred_std": pred_var.sqrt().item(),
+        }
+
+    @staticmethod
+    def _policy_action_from_dist(dist: Any) -> Tensor | None:
+        for attr_name in ("mean", "loc", "mode"):
+            try:
+                value = getattr(dist, attr_name, None)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            if callable(value):
+                try:
+                    value = value()
+                except TypeError:
+                    continue
+            if isinstance(value, Tensor):
+                return value
+        return None
+
+    def _param_grad_norm(self, params: Any) -> Tensor:
+        total_sq: Tensor | None = None
+        for param in params:
+            grad = getattr(param, "grad", None)
+            if grad is None:
+                continue
+            grad_tensor = grad.detach().float()
+            grad_sq = grad_tensor.pow(2).sum()
+            total_sq = grad_sq if total_sq is None else total_sq + grad_sq
+        if total_sq is None:
+            return torch.zeros((), device=self.device)
+        return total_sq.sqrt()
 
     def update(
         self,
@@ -532,73 +679,71 @@ class IPMD(PPO):
         expert_batch: TensorDict,
         has_expert: Tensor,
     ) -> tuple[TensorDict, int]:
-        """PPO update plus IPMD reward loss; fixed path for torch.compile and CUDA graphs."""
+        """PPO update plus optional BC loss and IPMD reward loss."""
         self.optim.zero_grad(set_to_none=True)
-        assert isinstance(self.config, IPMDRLOptConfig)
 
         # 1) PPO loss
         loss: TensorDict = self.loss_module(batch)
-        critic_loss = loss["loss_critic"]
-        actor_loss = loss["loss_objective"] + loss["loss_entropy"]
-        total_ppo_loss = critic_loss + actor_loss
-        total_ppo_loss.backward()
-
+        (loss["loss_critic"] + loss["loss_objective"] + loss["loss_entropy"]).backward()
         output_loss = loss.clone().detach_()
 
-        # 2) IPMD reward loss (always computed; scaled by has_expert for fixed graph)
-        r_pi = self._reward_from_batch(batch)
-        r_exp = self._reward_from_batch(expert_batch.to(self.device))
-        diff = r_pi.mean() - r_exp.mean()
-        l2 = torch.zeros((), device=self.device)
-        # for p in self.reward_estimator.parameters():
-        #     l2 = l2 + p.pow(2).sum()
-        l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
-        total_reward_loss = (
-            float(self.config.ipmd.reward_loss_coeff) * diff
-            + float(self.config.ipmd.reward_l2_coeff) * l2.pow(0.5)
-        ) * has_expert
-        total_reward_loss.backward()
+        # 2) Behavior cloning on expert actions.
+        bc_loss = torch.zeros((), device=self.device)
 
-        reward_diff = diff.detach()
-        reward_l2 = l2.detach()
-
-        # 3) Behavior cloning loss on expert actions (scaled by has_expert)
-        bc_coeff = float(self.config.ipmd.bc_loss_coeff)
-        if bc_coeff > 0.0:
-            expert_obs_td = expert_batch.select(*self._policy_obs_keys).to(self.device)
-            policy_op = self.actor_critic.get_policy_operator()
-            expert_policy_td = policy_op(expert_obs_td)
-            loc = expert_policy_td.get("loc")
-            scale = expert_policy_td.get("scale")
-            expert_action = expert_batch.get("action").to(self.device)
-            # Gaussian log-prob: sum over action dims, mean over batch
-            log_prob = -0.5 * (
-                ((expert_action - loc) / scale).pow(2)
-                + 2.0 * scale.log()
-                + math.log(2.0 * math.pi)
-            )
-            log_prob = log_prob.sum(dim=-1)  # sum over action dims
-            bc_loss = -log_prob.mean() * bc_coeff * has_expert
+        if self._bc_coeff > 0.0:
+            expert_action = self._expert_action_from_td(expert_batch)
+            expert_obs_td = expert_batch.select(*self._policy_obs_keys)
+            dist = self._policy_operator.get_dist(expert_obs_td)
+            log_prob = dist.log_prob(expert_action)
+            log_prob = self._reduce_log_prob(log_prob, expert_action)
+            has_expert_float = has_expert.to(dtype=log_prob.dtype)
+            bc_nll = -log_prob.mean() * has_expert_float
+            bc_loss = bc_nll * self._bc_coeff
             bc_loss.backward()
-            output_loss_bc = bc_loss.detach()
-        else:
-            output_loss_bc = torch.tensor(0.0, device=self.device)
+            policy_action = self._policy_action_from_dist(dist)
+            action_delta = policy_action.detach() - expert_action.detach()
+            expert_action_f = expert_action.detach().float()
+            policy_action_f = policy_action.detach().float()
+            log_prob_f = log_prob.detach().float()
+            actor_grad_norm = self._param_grad_norm(self._policy_operator.parameters())
 
-        # Gradient clipping (always call for fixed graph)
-        grad_params = list(self.actor_critic.parameters()) + list(
-            self.reward_estimator.parameters()
-        )
-        max_grad_norm = getattr(self.config.optim, "max_grad_norm", None) or 1e10
-        grad_norm_tensor = clip_grad_norm_(grad_params, max_grad_norm)
+        # 3) IPMD reward loss
+        r_pi = self._reward_from_batch(batch)
+        r_exp = self._reward_from_batch(expert_batch)
+        diff = r_pi.mean() - r_exp.mean()
+        l2 = r_pi.pow(2).mean() + r_exp.pow(2).mean()
+        (
+            self._reward_loss_coeff * diff + self._reward_l2_coeff * l2.pow(0.5)
+        ).backward()
+
+        # Gradient clipping — always call for a fixed graph
+        grad_norm_tensor = clip_grad_norm_(self._grad_clip_params, self._max_grad_norm)
 
         self.optim.step()
-        if self.lr_scheduler and self.lr_scheduler_step == "update":
-            self.lr_scheduler.step()
 
-        output_loss.set("alpha", torch.tensor(1.0, device=self.device))
-        output_loss.set("loss_reward_diff", reward_diff)
-        output_loss.set("loss_reward_l2", reward_l2)
-        output_loss.set("loss_bc", output_loss_bc)
+        output_loss.set("alpha", torch.ones((), device=self.device))
+        output_loss.set("loss_reward_diff", diff.detach())
+        output_loss.set("loss_reward_l2", l2.detach())
+        if self._bc_coeff > 0.0:
+            output_loss.set("loss_bc", bc_loss.detach())
+            output_loss.set("bc_nll", bc_nll.detach())
+            output_loss.set("bc_has_expert", has_expert_float.detach())
+            output_loss.set("bc_log_prob_mean", log_prob_f.mean())
+            output_loss.set(
+                "bc_log_prob_nan_frac", torch.isnan(log_prob_f).float().mean()
+            )
+            output_loss.set("bc_expert_action_abs_mean", expert_action_f.abs().mean())
+            output_loss.set(
+                "bc_expert_action_zero_frac",
+                expert_action_f.abs().lt(1e-6).float().mean(),
+            )
+            output_loss.set(
+                "bc_expert_action_nan_frac", torch.isnan(expert_action_f).float().mean()
+            )
+            output_loss.set("bc_policy_action_abs_mean", policy_action_f.abs().mean())
+            output_loss.set("bc_policy_action_mae", action_delta.abs().mean())
+            output_loss.set("bc_policy_action_rmse", action_delta.pow(2).mean().sqrt())
+            output_loss.set("bc_actor_grad_norm", actor_grad_norm.detach())
         output_loss.set("grad_norm", grad_norm_tensor.detach())
         output_loss.set(
             "lr",
@@ -608,14 +753,11 @@ class IPMD(PPO):
                 dtype=torch.float32,
             ),
         )
-        output_loss.set("skipped_update", torch.tensor(False, device=self.device))
-
         with torch.no_grad():
-            diag_rewards = self._reward_from_batch(batch)
-            output_loss.set("estimated_reward_mean", diag_rewards.mean())
-            output_loss.set("estimated_reward_std", diag_rewards.std())
-            output_loss.set("expert_reward_mean", r_exp.mean().nan_to_num(0.0))
-            output_loss.set("expert_reward_std", r_exp.std().nan_to_num(0.0))
+            output_loss.set("estimated_reward_mean", r_pi.mean().detach())
+            output_loss.set("estimated_reward_std", r_pi.std().detach())
+            output_loss.set("expert_reward_mean", r_exp.mean().detach().nan_to_num(0.0))
+            output_loss.set("expert_reward_std", r_exp.std().detach().nan_to_num(0.0))
 
         return output_loss, num_network_updates + 1
 
@@ -626,7 +768,17 @@ class IPMD(PPO):
 
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
-        pbar = tqdm.tqdm(total=self.config.collector.total_frames)
+        trainer_cfg = cfg.trainer
+        show_progress_bar = (
+            True if trainer_cfg is None else bool(trainer_cfg.progress_bar)
+        )
+        periodic_log_interval_frames = (
+            1000 if trainer_cfg is None else max(1, int(trainer_cfg.log_interval))
+        )
+        next_periodic_log_frames = periodic_log_interval_frames
+        pbar = tqdm.tqdm(
+            total=self.config.collector.total_frames, disable=not show_progress_bar
+        )
 
         num_mini_batches = cfg.collector.frames_per_batch // cfg.loss.mini_batch_size
         if cfg.collector.frames_per_batch % cfg.loss.mini_batch_size != 0:
@@ -649,20 +801,27 @@ class IPMD(PPO):
         total_iter = len(self.collector)
         policy_op = self.actor_critic.get_policy_operator()
 
-        if self._expert_buffer is None and not self._warned_no_expert:
+        if (
+            self._expert_buffer is None
+            and self._expert_batch_sampler is None
+            and not self._warned_no_expert
+        ):
             logging.getLogger(__name__).warning(
-                "Expert buffer not set; reward estimator updates will use dummy batch (has_expert=0)."
+                "Expert source not set; reward estimator updates will use a dummy expert batch."
             )
             self._warned_no_expert = True
 
         for _i in range(total_iter):
+            collect_start = time.perf_counter()
             with timeit("collecting"):
                 data = next(collector_iter)
+            collect_time = time.perf_counter() - collect_start
 
             metrics_to_log: dict[str, Any] = {}
             frames_in_batch = data.numel()
             collected_frames += frames_in_batch
-            pbar.update(frames_in_batch)
+            if show_progress_bar:
+                pbar.update(frames_in_batch)
 
             if ("next", "reward") in data.keys(True):
                 step_rewards = data["next", "reward"]
@@ -689,31 +848,62 @@ class IPMD(PPO):
                         }
                     )
 
-            # Optionally replace env rewards with estimated rewards for PPO (before GAE)
-            if cfg.ipmd.use_estimated_rewards_for_ppo:
+            self.data_buffer.empty()
+            learn_start = time.perf_counter()
+            with timeit("training"):
                 with torch.no_grad():
-                    est_rew = self._reward_from_batch(data)
-                if cfg.ipmd.detach_reward_when_used_for_ppo:
-                    est_rew = est_rew.detach()
-                est_rew = torch.clamp(est_rew, 0.0, 0.25)
+                    est_rew_raw = self._reward_from_batch(data)
+                est_rew_raw = est_rew_raw.detach()
+                clamp_min = cfg.ipmd.estimated_reward_clamp_min
+                clamp_max = cfg.ipmd.estimated_reward_clamp_max
+                est_rew = est_rew_raw
+                if clamp_min is not None or clamp_max is not None:
+                    est_rew = torch.clamp(est_rew_raw, min=clamp_min, max=clamp_max)
                 # Save original env reward for metrics, then replace
-                data.set(("next", "env_reward"), data.get(("next", "reward")))
+                env_rew = data.get(("next", "reward"))
+                mixed_rew = (
+                    self.config.ipmd.estimated_reward_mix_coeff * est_rew
+                    + (1 - self.config.ipmd.estimated_reward_mix_coeff) * env_rew
+                )
+                data.set(("next", "env_reward"), env_rew)
+                data.set(("next", "estimated_reward_raw"), est_rew_raw)
+                data.set(("next", "estimated_reward_clamped"), est_rew)
                 data.set(
                     ("next", "reward"),
-                    0.3 * est_rew + data.get(("next", "env_reward")),
+                    mixed_rew,
                 )
+                metrics_to_log["train/estimated_reward_mix_coeff"] = float(
+                    self.config.ipmd.estimated_reward_mix_coeff
+                )
+                metrics_to_log.update(
+                    self._reward_tensor_stats("train/estimated_reward_raw", est_rew_raw)
+                )
+                metrics_to_log.update(
+                    self._reward_tensor_stats("train/estimated_reward_clamped", est_rew)
+                )
+                metrics_to_log.update(
+                    self._reward_tensor_stats("train/ppo_reward", mixed_rew)
+                )
+                if clamp_min is not None:
+                    metrics_to_log["reward/clip_low_frac"] = (
+                        (est_rew_raw <= clamp_min).float().mean().item()
+                    )
+                    metrics_to_log["reward/clamp_min"] = float(clamp_min)
+                if clamp_max is not None:
+                    metrics_to_log["reward/clip_high_frac"] = (
+                        (est_rew_raw >= clamp_max).float().mean().item()
+                    )
+                    metrics_to_log["reward/clamp_max"] = float(clamp_max)
+                # Compute GAE and populate replay buffer once per rollout.
+                with torch.no_grad(), timeit("training/adv"):
+                    data = self.adv_module(data)
+                    if getattr(self.config.compile, "compile_mode", None):
+                        data = data.clone()
 
-            self.data_buffer.empty()
-            with timeit("training"):
+                with timeit("training/rb_extend"):
+                    self.data_buffer.extend(data.reshape(-1))
+
                 for j in range(cfg_loss_ppo_epochs):
-                    with torch.no_grad(), timeit("adv"):
-                        data = self.adv_module(data)
-                        if getattr(self.config.compile, "compile_mode", None):
-                            data = data.clone()
-
-                    with timeit("rb - extend"):
-                        self.data_buffer.extend(data.reshape(-1))
-
                     for k, batch in enumerate(self.data_buffer):
                         kl_context = None
                         if (cfg.optim.scheduler or "").lower() == "adaptive":
@@ -725,23 +915,27 @@ class IPMD(PPO):
                             or not self._check_expert_batch_keys(expert_batch_raw)
                         ):
                             self.log.warning("No expert batch found")
-                            expert_batch = self._dummy_expert_batch(batch)
-                            has_expert = torch.tensor(
-                                0.0, device=self.device, dtype=torch.float32
+                            expert_batch_for_update = self._dummy_expert_batch(
+                                batch
+                            ).to(self.device)
+                            has_expert = torch.zeros(
+                                (), device=self.device, dtype=torch.float32
                             )
                         else:
-                            expert_batch = expert_batch_raw.to(self.device)
-                            has_expert = torch.tensor(
-                                1.0, device=self.device, dtype=torch.float32
+                            expert_batch_for_update = expert_batch_raw.to(self.device)
+                            has_expert = torch.ones(
+                                (), device=self.device, dtype=torch.float32
                             )
-                        with timeit("update"):
+                        with timeit("training/update"):
                             loss, num_network_updates = self.update(
                                 batch,
                                 num_network_updates,
-                                expert_batch,
+                                expert_batch_for_update,
                                 has_expert,
                             )
                             loss = loss.clone()
+                        if self.lr_scheduler and self.lr_scheduler_step == "update":
+                            self.lr_scheduler.step()
                         if kl_context is not None:
                             kl_approx = self._compute_kl_after_update(
                                 kl_context, policy_op
@@ -757,6 +951,18 @@ class IPMD(PPO):
                             "loss_reward_diff",
                             "loss_reward_l2",
                             "loss_bc",
+                            "bc_nll",
+                            "bc_has_expert",
+                            "bc_log_prob_mean",
+                            "bc_log_prob_nan_frac",
+                            "bc_expert_action_abs_mean",
+                            "bc_expert_action_zero_frac",
+                            "bc_expert_action_nan_frac",
+                            "bc_policy_action_abs_mean",
+                            "bc_policy_action_mae",
+                            "bc_policy_action_rmse",
+                            "bc_actor_grad_norm",
+                            "bc_policy_scale_mean",
                             "estimated_reward_mean",
                             "estimated_reward_std",
                             "expert_reward_mean",
@@ -780,28 +986,58 @@ class IPMD(PPO):
 
                     if self.lr_scheduler and self.lr_scheduler_step == "epoch":
                         self.lr_scheduler.step()
+            learn_time = time.perf_counter() - learn_start
+            iter_time = collect_time + learn_time
+            fps = float(frames_in_batch) / iter_time if iter_time > 0.0 else 0.0
 
             # EPIC distance between estimated and true env reward (invariant to
             # potential-based shaping and positive rescaling).
             with torch.no_grad():
-                if cfg.ipmd.use_estimated_rewards_for_ppo and (
-                    "next",
-                    "env_reward",
-                ) in data.keys(True):
+                if ("next", "env_reward") in data.keys(True):
                     env_rew = data["next", "env_reward"]
-                    est_rew_diag = data["next", "reward"]  # already replaced
-                    metrics_to_log["train/env_reward_mean"] = env_rew.mean().item()
-                    metrics_to_log["train/env_reward_std"] = env_rew.std().item()
-                elif ("next", "reward") in data.keys(True):
-                    env_rew = data["next", "reward"]
-                    est_rew_diag = self._reward_from_batch(data)
                 else:
-                    env_rew = None
-                    est_rew_diag = None
-                if env_rew is not None and est_rew_diag is not None:
-                    pearson_corr, epic_dist = epic_distance(est_rew_diag, env_rew)
-                    metrics_to_log["reward/pearson_corr"] = pearson_corr.item()
-                    metrics_to_log["reward/epic_distance"] = epic_dist.item()
+                    env_rew = (
+                        data["next", "reward"]
+                        if ("next", "reward") in data.keys(True)
+                        else None
+                    )
+                raw_est_rew_diag = (
+                    data["next", "estimated_reward_raw"]
+                    if ("next", "estimated_reward_raw") in data.keys(True)
+                    else None
+                )
+                clamped_est_rew_diag = (
+                    data["next", "estimated_reward_clamped"]
+                    if ("next", "estimated_reward_clamped") in data.keys(True)
+                    else None
+                )
+                mixed_est_rew_diag = (
+                    data["next", "reward"]
+                    if ("next", "reward") in data.keys(True)
+                    else None
+                )
+                if env_rew is not None:
+                    metrics_to_log.update(
+                        self._reward_tensor_stats("train/env_reward", env_rew)
+                    )
+                if env_rew is not None and raw_est_rew_diag is not None:
+                    metrics_to_log.update(
+                        self._reward_alignment_metrics(
+                            "reward/raw_vs_env", raw_est_rew_diag, env_rew
+                        )
+                    )
+                if env_rew is not None and clamped_est_rew_diag is not None:
+                    metrics_to_log.update(
+                        self._reward_alignment_metrics(
+                            "reward/clamped_vs_env", clamped_est_rew_diag, env_rew
+                        )
+                    )
+                if env_rew is not None and mixed_est_rew_diag is not None:
+                    metrics_to_log.update(
+                        self._reward_alignment_metrics(
+                            "reward/mixed_vs_env", mixed_est_rew_diag, env_rew
+                        )
+                    )
 
             # Aggregate and log losses
             losses_mean = losses.apply(lambda x: x.float().mean(), batch_size=[])
@@ -817,16 +1053,22 @@ class IPMD(PPO):
                     device=self.device,
                     dtype=torch.float32,
                 )
-            metrics_to_log["train/clip_epsilon"] = clip_epsilon_value
+            metrics_to_log["train/clip_epsilon"] = clip_epsilon_value.item()
+            metrics_to_log["time/collection_time"] = collect_time
+            metrics_to_log["time/learning_time"] = learn_time
+            metrics_to_log["time/iteration_time"] = iter_time
+            metrics_to_log["time/speed"] = fps
 
-            if "Isaac" in cfg.env.env_name and hasattr(self.env, "log_infos"):
-                log_info_dict: dict[str, Tensor] = self.env.log_infos.popleft()
+            if (
+                "Isaac" in cfg.env.env_name
+                and hasattr(self.env, "log_infos")
+                and len(self.env.log_infos) > 0
+            ):
+                log_info_dict: dict[str, Tensor] = self.env.log_infos.pop()
+                self.env.log_infos.clear()
                 log_info(log_info_dict, metrics_to_log)
 
             metrics_to_log.update(timeit.todict(prefix="time"))  # type: ignore
-            rate = pbar.format_dict.get("rate")
-            if rate is not None:
-                metrics_to_log["time/speed"] = rate
             self.log_metrics(metrics_to_log, step=collected_frames)
             self.collector.update_policy_weights_()
 
@@ -841,8 +1083,33 @@ class IPMD(PPO):
                 postfix["reward_diff"] = (
                     f"{metrics_to_log['train/loss_reward_diff']:.3f}"
                 )
-            if postfix:
+            if show_progress_bar and postfix:
                 pbar.set_postfix(postfix)
+            elif not show_progress_bar and (
+                collected_frames >= next_periodic_log_frames or (_i + 1) == total_iter
+            ):
+                status_parts = [
+                    f"iter={_i + 1}/{total_iter}",
+                    f"frames={collected_frames}/{cfg.collector.total_frames}",
+                ]
+                summary_metrics: tuple[tuple[str, str], ...] = (
+                    ("train/step_reward_mean", "r_step"),
+                    ("episode/length", "ep_len"),
+                    ("episode/return", "r_ep"),
+                    ("train/loss_objective", "pi_loss"),
+                    ("train/loss_reward_diff", "reward_diff"),
+                    ("train/expert_reward_mean", "exp_r"),
+                    ("time/speed", "fps"),
+                    ("time/collection_time", "t_col"),
+                    ("time/learning_time", "t_lrn"),
+                )
+                for metric_key, alias in summary_metrics:
+                    metric_value = metrics_to_log.get(metric_key)
+                    if isinstance(metric_value, (int, float, np.floating)):
+                        status_parts.append(f"{alias}={float(metric_value):.4f}")
+                self.log.info(" | ".join(status_parts))
+                while collected_frames >= next_periodic_log_frames:
+                    next_periodic_log_frames += periodic_log_interval_frames
 
             if (
                 self.config.save_interval > 0
@@ -855,33 +1122,6 @@ class IPMD(PPO):
 
         pbar.close()
         self.collector.shutdown()
-
-    def validate_ipmd_loss(
-        self, test_batch: TensorDict, expert_batch: TensorDict
-    ) -> dict[str, float]:
-        """Validate IPMD loss computation (reward diff + L2) and PPO loss on test data."""
-        for m in (self.actor_critic, self.reward_estimator):
-            if hasattr(m, "eval"):
-                m.eval()
-        with torch.no_grad():
-            estimated_rewards = self._reward_from_batch(test_batch)
-            expert_rewards = self._reward_from_batch(expert_batch)
-            reward_diff = (estimated_rewards.sum() - expert_rewards.sum()).item()
-            l2_reg = sum(
-                p.pow(2).sum().item() for p in self.reward_estimator.parameters()
-            )
-            ppo_loss_td = self.loss_module(test_batch)
-            return {
-                "reward_diff": reward_diff,
-                "reward_l2": l2_reg,
-                "estimated_reward_mean": estimated_rewards.mean().item(),
-                "estimated_reward_std": estimated_rewards.std().item(),
-                "expert_reward_mean": expert_rewards.mean().item(),
-                "expert_reward_std": expert_rewards.std().item(),
-                "ppo_loss_critic": ppo_loss_td["loss_critic"].item(),
-                "ppo_loss_objective": ppo_loss_td["loss_objective"].item(),
-                "ppo_loss_entropy": ppo_loss_td["loss_entropy"].item(),
-            }
 
     def predict(self, obs: Tensor | np.ndarray | Mapping[Any, Any]) -> Tensor:  # type: ignore[override]
         """Predict action given observation (deterministic)."""
