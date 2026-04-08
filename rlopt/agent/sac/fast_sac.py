@@ -280,13 +280,19 @@ class FastSAC(SAC):
         # train() computes the right number of updates.
         cfg = self.config
         sac_cfg = cfg.sac
+        prev_utd: float | None = None
         if sac_cfg.feature_update_ratio is not None:
             # Parent computes: num_updates = int(frames_per_batch * utd_ratio)
             # We want: num_updates = feature_update_ratio
+            prev_utd = float(sac_cfg.utd_ratio)
             fpb = cfg.collector.frames_per_batch
             if fpb > 0:
                 sac_cfg.utd_ratio = float(sac_cfg.feature_update_ratio) / float(fpb)
             else:
                 sac_cfg.utd_ratio = 1.0
 
-        super().train()
+        try:
+            super().train()
+        finally:
+            if prev_utd is not None:
+                sac_cfg.utd_ratio = prev_utd

@@ -135,6 +135,24 @@ class SACRLOptConfig(RLOptConfig):
         self.value_function = None
 
 
+class _CatMLP(torch.nn.Module):
+    """Wraps an nn.Sequential so it accepts multiple positional tensor inputs.
+
+    TorchRL's ValueOperator calls the Q-network with one tensor per in_key
+    (e.g. obs_key_1, obs_key_2, ..., action). TorchRL's own MLP handles this
+    by concatenating all inputs along the last dim before the first linear layer.
+    nn.Sequential.forward() only accepts a single argument, so this thin wrapper
+    replicates TorchRL's behaviour for our manually-built LayerNorm network.
+    """
+
+    def __init__(self, net: torch.nn.Sequential) -> None:
+        super().__init__()
+        self.net = net
+
+    def forward(self, *inputs: torch.Tensor) -> torch.Tensor:
+        return self.net(torch.cat(inputs, dim=-1))
+
+
 class SAC(BaseAlgorithm):
     """Soft Actor-Critic algorithm.
 
@@ -265,13 +283,34 @@ class SAC(BaseAlgorithm):
             raise ValueError(msg)
 
         num_cells = list(self.config.q_function.num_cells)
-        q_function = MLP(
-            in_features=self.config.q_function.input_dim,
-            activation_class=get_activation_class(self.config.q_function.activation_fn),
-            num_cells=num_cells,
-            out_features=1,
-            device=self.device,
-        )
+        q_fn_cfg = self.config.q_function
+        use_layer_norm = getattr(q_fn_cfg, "use_layer_norm", False)
+        act_cls = get_activation_class(q_fn_cfg.activation_fn)
+        if use_layer_norm:
+            # TorchRL's ValueOperator calls the module with one tensor per in_key
+            # (multiple positional args). nn.Sequential only accepts one, so we wrap it
+            # in _CatMLP which concatenates all inputs before the Sequential — exactly
+            # what TorchRL's MLP does internally.
+            # LayerNorm after each hidden layer is the DroQ (Hiraoka 2022) stability technique.
+            layers: list[torch.nn.Module] = []
+            for i, hidden in enumerate(num_cells):
+                if i == 0 and q_fn_cfg.input_dim is None:
+                    layers.append(torch.nn.LazyLinear(hidden))
+                else:
+                    in_f = (q_fn_cfg.input_dim if i == 0 else num_cells[i - 1])
+                    layers.append(torch.nn.Linear(in_f, hidden))
+                layers.append(torch.nn.LayerNorm(hidden))
+                layers.append(act_cls())
+            layers.append(torch.nn.Linear(num_cells[-1], 1))
+            q_function = _CatMLP(torch.nn.Sequential(*layers)).to(self.device)
+        else:
+            q_function = MLP(
+                in_features=q_fn_cfg.input_dim,
+                activation_class=act_cls,
+                num_cells=num_cells,
+                out_features=1,
+                device=self.device,
+            )
 
         # SAC Q-function takes both observation and action as inputs
         in_keys = self.config.q_function.get_input_keys()

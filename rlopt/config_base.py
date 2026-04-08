@@ -40,7 +40,18 @@ class CollectorConfig:
     """Whether to set truncated to True when the episode is done."""
 
     init_random_frames: int = 1000
-    """Number of random frames to collect."""
+    """Number of random transitions to collect before first SAC-style update.
+
+    For IsaacLab vectorized runs, prefer :attr:`warmup_collects` so this value is
+    derived as ``warmup_collects * frames_per_batch`` after ``frames_per_batch``
+    is finalized (see IsaacLab ``scripts/rlopt/train.py``).
+    """
+
+    warmup_collects: int | None = None
+    """If set (e.g. by a task config), training scripts may override
+    ``init_random_frames`` to ``warmup_collects * frames_per_batch`` once the
+    per-iteration batch size is known. Off-policy only; ignored when ``None``.
+    """
 
     scratch_dir: str | None = None
     """Directory to save scratch data."""
@@ -304,6 +315,14 @@ class NetworkConfig:
 
     activation_fn: str = "elu"
     """Activation function."""
+
+    use_layer_norm: bool = False
+    """Apply LayerNorm after each hidden activation.
+
+    DroQ (Hiraoka 2022) shows LayerNorm is the primary stabilizer for high-UTD
+    training — more important than dropout. Recommended for UTD > 1, especially
+    for critic networks in high-DoF tasks where Q-value explosion is common.
+    """
 
     kwargs: dict[str, Any] = field(default_factory=dict)
     """Additional keyword arguments for the network."""
