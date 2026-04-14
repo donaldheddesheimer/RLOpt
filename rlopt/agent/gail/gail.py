@@ -6,7 +6,7 @@ import warnings
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Generic, TypeVar, cast
 
 import numpy as np
 import torch
@@ -16,7 +16,7 @@ from tensordict import TensorDict
 from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torchrl._utils import timeit
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import Collector
 from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import RandomSampler
 
@@ -27,10 +27,7 @@ from rlopt.utils import log_info
 from .discriminator import Discriminator
 
 
-class ExpertReplayBuffer(Protocol):
-    def sample(self, batch_size: int | None = None) -> TensorDict: ...
-
-    def __len__(self) -> int: ...
+GailCfgT = TypeVar("GailCfgT", bound="GAILRLOptConfig")
 
 
 @dataclass
@@ -147,16 +144,14 @@ class AMPRLOptConfig(GAILRLOptConfig):
     """Configuration alias for AMP (same fields as GAIL)."""
 
 
-class GAIL(PPO):
+class GAIL(PPO[GailCfgT], Generic[GailCfgT]):
     """GAIL with PPO policy optimization and discriminator reward."""
 
-    def __init__(self, env, config: GAILRLOptConfig):
-        self.config = config
-        self._expert_buffer: ExpertReplayBuffer | None = None
+    def __init__(self, env, config: GailCfgT):
+        self.config: GailCfgT = config
         self._expert_batch_sampler: (
             Callable[[int, list[BatchKey]], TensorDict | None] | None
         ) = None
-        self._warned_no_expert = False
 
         self._disc_obs_keys = self._resolve_discriminator_obs_keys(env, self.config)
         self._disc_obs_feature_ndims = {
@@ -427,10 +422,6 @@ class GAIL(PPO):
         replay_batch = replay_batch.select(*required_keys)
         return cast(TensorDict, torch.cat([policy_batch, replay_batch], dim=0))
 
-    def set_expert_buffer(self, expert_buffer: ExpertReplayBuffer) -> None:
-        self._expert_buffer = expert_buffer
-        self.log.info("Expert buffer attached: %d samples", len(expert_buffer))
-
     def _discriminator_expert_required_keys(self) -> list[BatchKey]:
         """Return expert keys required for discriminator updates.
 
@@ -442,45 +433,52 @@ class GAIL(PPO):
             required.append("action")
         return dedupe_keys(required)
 
-    def _next_expert_batch(self, batch_size: int | None = None) -> TensorDict | None:
+    def _require_expert_batch_keys(
+        self,
+        expert_batch: TensorDict,
+        required_keys: list[BatchKey],
+    ) -> None:
+        available_keys = set(expert_batch.keys(True))
+        missing = [key for key in required_keys if key not in available_keys]
+        if len(missing) == 0:
+            return
+        msg = (
+            f"Expert sampler contract violated. Missing keys: {missing}. "
+            f"Required keys: {required_keys}. Available keys: {list(expert_batch.keys(True))}."
+        )
+        raise KeyError(msg)
+
+    def _next_expert_batch(self, batch_size: int | None = None) -> TensorDict:
         if batch_size is None:
             batch_size = int(self.config.gail.expert_batch_size)
 
-        if self._expert_buffer is not None:
-            try:
-                batch = cast(
-                    TensorDict,
-                    self._expert_buffer.sample(batch_size=batch_size),
-                )
-            except TypeError:
-                try:
-                    batch = cast(TensorDict, self._expert_buffer.sample())
-                except Exception as exc:  # pragma: no cover - defensive
-                    self.log.warning("Failed to sample expert batch: %s", exc)
-                    return None
-            except Exception as exc:  # pragma: no cover - defensive
-                self.log.warning("Failed to sample expert batch: %s", exc)
-                return None
-
-            if batch_size is not None and batch.numel() > batch_size:
-                batch = cast(TensorDict, batch[:batch_size])
-            return batch.to(self.device)
-
         if self._expert_batch_sampler is None:
-            return None
+            raise RuntimeError(
+                "Expert sampler is required for GAIL/ASE training. "
+                "Expected env.sample_expert_batch(...) or a private test override."
+            )
+
+        required_keys = self._discriminator_expert_required_keys()
         try:
             sampled = self._expert_batch_sampler(
                 int(batch_size),
-                self._discriminator_expert_required_keys(),
+                required_keys,
             )
         except Exception as exc:
-            self.log.warning("Failed to sample expert batch from sampler: %s", exc)
-            return None
+            raise RuntimeError("Failed to sample expert batch from sampler.") from exc
         if sampled is None:
-            return None
+            raise RuntimeError("Expert sampler returned None.")
         if sampled.numel() > int(batch_size):
             sampled = cast(TensorDict, sampled[: int(batch_size)])
-        return sampled.to(self.device)
+        sampled = sampled.to(self.device)
+        self._log_batch_contract_once(
+            flag_attr="_expert_batch_contract_logged",
+            context="expert",
+            batch=sampled,
+            required_keys=required_keys,
+        )
+        self._require_expert_batch_keys(sampled, required_keys)
+        return sampled
 
     def _obs_features_from_td(self, td: TensorDict, *, detach: bool) -> Tensor:
         parts: list[Tensor] = []
@@ -796,14 +794,6 @@ class GAIL(PPO):
     def _update_discriminator(
         self, rollout_flat: TensorDict, update_idx: int
     ) -> dict[str, float]:
-        if self._expert_buffer is None and self._expert_batch_sampler is None:
-            if not self._warned_no_expert:
-                self.log.warning(
-                    "No expert source set. Training falls back to environment reward."
-                )
-                self._warned_no_expert = True
-            return {}
-
         if update_idx < int(self.config.gail.discriminator_update_warmup_updates):
             return {"discriminator_update_mask": 0.0}
         ratio = max(1, int(self.config.gail.discriminator_optimization_ratio))
@@ -841,8 +831,6 @@ class GAIL(PPO):
             expert_td = self._next_expert_batch(
                 batch_size=self.config.gail.expert_batch_size
             )
-            if expert_td is None:
-                continue
 
             expert_obs = self._obs_features_from_td(expert_td, detach=False).to(
                 self.device
@@ -1023,9 +1011,18 @@ class GAIL(PPO):
             "gail/reward_mix_abs_gap": float(reward_abs_gap),
         }
 
+    def validate_training(self) -> None:
+        super().validate_training()
+        if self._expert_batch_sampler is None:
+            raise RuntimeError(
+                "GAIL/ASE training requires env.sample_expert_batch(...). "
+                "Tests may install a private expert sampler override."
+            )
+
     def train(self) -> None:  # type: ignore[override]
         cfg = self.config
         assert isinstance(cfg, GAILRLOptConfig)
+        self.validate_training()
 
         collected_frames = 0
         num_network_updates = torch.zeros((), dtype=torch.int64, device=self.device)
@@ -1045,7 +1042,7 @@ class GAIL(PPO):
         cfg_loss_clip_epsilon = cfg.ppo.clip_epsilon
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])
 
-        self.collector = cast(SyncDataCollector, self.collector)
+        self.collector = cast(Collector, self.collector)
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         policy_op = self.actor_critic.get_policy_operator()
@@ -1111,7 +1108,7 @@ class GAIL(PPO):
                 for j in range(cfg_loss_ppo_epochs):
                     with torch.no_grad(), timeit("adv"):
                         data = self.adv_module(data)
-                        if self.config.compile.compile_mode:
+                        if self.config.compile.compile:
                             data = data.clone()
 
                     with timeit("rb - extend"):
@@ -1181,12 +1178,13 @@ class GAIL(PPO):
             if rate is not None:
                 metrics_to_log["time/speed"] = rate
 
-            self.log_metrics(metrics_to_log, step=collected_frames)
+            self.log_metrics(metrics_to_log, step=collected_frames, log_python=False)
             self.collector.update_policy_weights_()
 
             if (
                 self.config.save_interval > 0
-                and num_network_updates % self.config.save_interval == 0
+                and int(collected_frames) > 0
+                and int(collected_frames) % self.config.save_interval == 0
             ):
                 self.save_model(
                     path=self.log_dir / self.config.logger.save_path,
@@ -1228,6 +1226,16 @@ class GAIL(PPO):
             "config": self.config,
             "gail_state": self._gail_state_dict(),
         }
+        if self.optim is not None:
+            checkpoint["optimizer_state_dict"] = self.optim.state_dict()
+        if self.lr_scheduler is not None:
+            checkpoint["lr_scheduler_state_dict"] = self.lr_scheduler.state_dict()
+        if (
+            hasattr(self.env, "is_closed")
+            and not self.env.is_closed
+            and hasattr(self.env, "normalize_obs")
+        ):
+            checkpoint["vec_norm_msg"] = self.env.state_dict()
         if self.discriminator_optim is not None:
             checkpoint["discriminator_optim"] = self.discriminator_optim.state_dict()
         torch.save(checkpoint, path)
@@ -1239,15 +1247,21 @@ class GAIL(PPO):
         self.actor_critic.load_state_dict(checkpoint["actor_critic"])
         if self.discriminator is not None and "discriminator" in checkpoint:
             self.discriminator.load_state_dict(checkpoint["discriminator"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optim.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.lr_scheduler is not None and "lr_scheduler_state_dict" in checkpoint:
+            self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
         if self.discriminator_optim is not None and "discriminator_optim" in checkpoint:
             self.discriminator_optim.load_state_dict(checkpoint["discriminator_optim"])
         gail_state = checkpoint.get("gail_state")
         if isinstance(gail_state, dict):
             self._load_gail_state_dict(gail_state)
+        if hasattr(self.env, "normalize_obs") and "vec_norm_msg" in checkpoint:
+            self.env.load_state_dict(checkpoint["vec_norm_msg"])
         self.log.info("Model loaded from %s", path)
 
 
-class AMP(GAIL):
+class AMP(GAIL[GailCfgT], Generic[GailCfgT]):
     """AMP variant with beyondAMP-style discriminator loss and reward shaping."""
 
     def _gail_discriminator_loss(
@@ -1281,8 +1295,14 @@ class AMP(GAIL):
             "discriminator_loss": loss.detach(),
             "expert_loss": expert_loss.detach(),
             "policy_loss": policy_loss.detach(),
-            "expert_accuracy": (expert_logits.squeeze(-1) > 0.0).float().mean().detach(),
-            "policy_accuracy": (policy_logits.squeeze(-1) < 0.0).float().mean().detach(),
+            "expert_accuracy": (expert_logits.squeeze(-1) > 0.0)
+            .float()
+            .mean()
+            .detach(),
+            "policy_accuracy": (policy_logits.squeeze(-1) < 0.0)
+            .float()
+            .mean()
+            .detach(),
             "expert_d_mean": expert_logits.mean().detach(),
             "policy_d_mean": policy_logits.mean().detach(),
         }

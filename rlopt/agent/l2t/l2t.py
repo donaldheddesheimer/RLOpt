@@ -16,7 +16,7 @@ from torch import Tensor
 from torchrl._utils import timeit
 
 # Import missing modules
-from torchrl.collectors import SyncDataCollector
+from torchrl.collectors import Collector
 from torchrl.data import LazyMemmapStorage, ReplayBuffer, TensorDictReplayBuffer
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.envs import Compose, ExplorationType, TransformedEnv
@@ -146,7 +146,7 @@ class L2TActorValueOperatorWrapper(SafeSequential):
         return self.get_student_operator()(tensordict)
 
 
-class L2T(BaseAlgorithm):
+class L2T(BaseAlgorithm[L2TRLOptConfig]):
     def __init__(
         self,
         env: TransformedEnv,
@@ -158,10 +158,9 @@ class L2T(BaseAlgorithm):
         logger: Logger | None = None,
         **kwargs,
     ):
-        # Narrow the type for static checkers early
-        self.config = config  # type: ignore
-        self.config: L2TRLOptConfig
-
+        # This class builds student modules before calling BaseAlgorithm.__init__(),
+        # so we temporarily store the typed config/env early.
+        self.config: L2TRLOptConfig = config
         self.env = env
 
         # construct the student actor-critic (separate layout and keys)
@@ -883,7 +882,7 @@ class L2T(BaseAlgorithm):
 
         losses = TensorDict(batch_size=[cfg_loss_ppo_epochs, num_mini_batches])  # type: ignore
 
-        self.collector: SyncDataCollector
+        self.collector: Collector
         collector_iter = iter(self.collector)
         total_iter = len(self.collector)
         for _i in range(total_iter):

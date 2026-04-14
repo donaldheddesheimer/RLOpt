@@ -360,7 +360,7 @@ class TrainerConfig:
     progress_bar: bool = False
     """Whether to show progress bar."""
 
-    log_interval: int = 10000
+    log_interval: int = 10_000_000
     """Interval for logging."""
 
 
@@ -410,7 +410,7 @@ class RLOptConfig:
     seed: int = 42
     """Random seed."""
 
-    log_level: str = "warning"
+    log_level: str = "info"
     """Verbosity for internal debug logging (e.g. ``"debug"``, ``"info"``)."""
 
     save_interval: int = 10
