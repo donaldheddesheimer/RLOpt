@@ -20,6 +20,10 @@ from rlopt.agent.ipmd.ipmd_bilinear import (
     IPMDBilinear,
     IPMDBilinearRLOptConfig,
 )
+from rlopt.agent.ipmd.ipmd_fastsac import (
+    IPMDFastSAC,
+    IPMDFastSACRLOptConfig,
+)
 
 __all__ = [
     "IPMD",
@@ -30,4 +34,6 @@ __all__ = [
     "IPMDRLOptConfig",
     "IPMDSRRLOptConfig",
     "IPMDBilinearRLOptConfig",
+    "IPMDFastSAC",
+    "IPMDFastSACRLOptConfig",
 ]

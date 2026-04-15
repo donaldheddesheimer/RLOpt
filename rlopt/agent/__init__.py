@@ -13,6 +13,8 @@ from rlopt.agent.ipmd import (
     IPMDRLOptConfig,
     IPMDSRRLOptConfig,
     IPMDBilinearRLOptConfig,
+    IPMDFastSAC,
+    IPMDFastSACRLOptConfig,
 )
 from rlopt.agent.fast_td3 import FastTD3, FastTD3RLOptConfig
 from rlopt.agent.gail import AMP, AMPRLOptConfig, GAIL, GAILRLOptConfig
@@ -32,6 +34,8 @@ __all__ = [
     "IPMDRLOptConfig",
     "IPMDSRRLOptConfig",
     "IPMDBilinearRLOptConfig",
+    "IPMDFastSAC",
+    "IPMDFastSACRLOptConfig",
     "FastTD3",
     "FastTD3RLOptConfig",
     "GAIL",
