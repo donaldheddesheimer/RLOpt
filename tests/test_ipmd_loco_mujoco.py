@@ -24,7 +24,6 @@ except Exception:
 
 
 def _apply_obs_latent_alias(cfg: IPMDRLOptConfig, obs_dim: int) -> None:
-    cfg.logger.backend = ""
     cfg.policy.input_keys = ["observation"]
     if cfg.value_function is not None:
         cfg.value_function.input_keys = ["observation"]
@@ -32,7 +31,7 @@ def _apply_obs_latent_alias(cfg: IPMDRLOptConfig, obs_dim: int) -> None:
     cfg.ipmd.latent_key = "observation"
     cfg.ipmd.latent_dim = obs_dim
     cfg.ipmd.bc_coef = 0.0
-    cfg.ipmd.latent_learning.method = "patch_autoencoder"
+    cfg.ipmd.latent_input_type = "s'"
 
 
 def _make_test_expert_sampler(expert_data: TensorDict):
