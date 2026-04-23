@@ -13,6 +13,7 @@ Architecture:
 """
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
 from dataclasses import dataclass, field
@@ -36,6 +37,8 @@ from rlopt.agent.sac.fastsac import (
 )
 from rlopt.config_utils import dedupe_keys, flatten_feature_tensor, next_obs_key
 from rlopt.utils import get_activation_class
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +257,10 @@ class IPMDFastSAC(FastSAC):
                 )
             )
         x = parts[0] if len(parts) == 1 else torch.cat(parts, dim=-1)
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        elif x.ndim > 2:
+            x = x.reshape(x.shape[0], -1)
         if requires_grad:
             x = x.detach().requires_grad_(True)
         return x
@@ -372,11 +379,21 @@ class IPMDFastSAC(FastSAC):
                     self.reward_estimator.eval()
                     r_est = self._estimate_reward(flat_data)
                     self.reward_estimator.train()
-                r_est = r_est.clamp(
-                    min=self._est_reward_clamp_min,
-                    max=self._est_reward_clamp_max,
-                )
-                rewards = env_rewards + self._est_reward_weight * r_est
+                if r_est.ndim != 1:
+                    r_est = r_est.reshape(-1)
+                if r_est.shape != env_rewards.shape:
+                    logger.warning(
+                        "Skipping reward augmentation: estimated reward shape %s does not match env reward shape %s.",
+                        tuple(r_est.shape),
+                        tuple(env_rewards.shape),
+                    )
+                    r_est = None
+                if r_est is not None:
+                    r_est = r_est.clamp(
+                        min=self._est_reward_clamp_min,
+                        max=self._est_reward_clamp_max,
+                    )
+                    rewards = env_rewards + self._est_reward_weight * r_est
             except (KeyError, RuntimeError):
                 # Reward obs keys not yet available (warm-up) — fall back to env reward
                 pass

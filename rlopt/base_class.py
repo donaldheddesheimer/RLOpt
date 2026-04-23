@@ -1292,10 +1292,6 @@ class BaseAlgorithm(Generic[CfgT], ABC):
         self, metadata: TrainingMetadata, iteration: IterationData
     ) -> bool:
         """Return whether this iteration should emit periodic logs."""
-        if metadata.progress_bar_enabled:
-            # The progress bar already provides live progress updates; avoid
-            # duplicate periodic logs and only emit logs at the final iteration.
-            return (iteration.iteration_idx + 1) == metadata.total_iterations
         return (
             metadata.frames_processed >= metadata.next_log_frame
             or (iteration.iteration_idx + 1) == metadata.total_iterations
@@ -1306,6 +1302,15 @@ class BaseAlgorithm(Generic[CfgT], ABC):
     ) -> None:
         """Refresh tqdm or emit periodic text summaries for headless runs."""
         if not self._should_log_iteration(metadata, iteration):
+            return
+
+        is_final_iteration = (iteration.iteration_idx + 1) == metadata.total_iterations
+
+        # Keep metric logging cadence independent from console verbosity.
+        # When tqdm is active, only print a text summary at the final iteration.
+        if metadata.progress_bar_enabled and not is_final_iteration:
+            while metadata.frames_processed >= metadata.next_log_frame:
+                metadata.next_log_frame += metadata.log_interval_frames
             return
 
         status_parts = [
